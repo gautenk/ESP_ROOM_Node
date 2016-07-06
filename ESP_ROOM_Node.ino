@@ -1,4 +1,4 @@
-//	ESP_DIG_V1.2
+//	ESP Roomsensor V1.1
 //
 //	This MQTT client will connect over Wifi to the MQTT broker and controls a digital output (LED, relay):
 //	- toggle output and send status message on local button press
@@ -12,8 +12,9 @@
 //	Message structure is equal to the RFM69-based gateway/node sytem by the same author.
 //	This means both type of gateway/nodes can be used in a single Openhab system.
 //
-//	The MQTT topic is /home/esp_gw/direction/nodeid/devid
+//	The MQTT topic is home/esp_gw/direction/nodeid/devid
 //	where direction is "sb" towards the node and "nb" towards the MQTT broker.
+//  A will is published in topic home/esp_gw/disconnected to indicate disconnection.
 //
 //	Defined devices are:
 //	0	uptime:		read uptime in minutes
@@ -25,9 +26,10 @@
 //  32  Red LED:      read/set red LED
 //  33  Green LED:    read/set green LED
 //  34  Blue LED:     read/set blue LED
-//  35  RGB LED:      set only rgb LED. read will send 32,33,34
+//  35  RGB LED:      set-only rgb LED. read will send 32,33,34
 //  40  Movement:     read PIR
 //  41  REED Switch:  read REEDSWITCH
+//  42  Water sensor: read Watersensor
 //  48  temperature:  read temperature
 //  49  humidity:     read humidity
 //  51  OW-temp     read onewire temperature values
@@ -44,32 +46,33 @@
 //
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
-#define VERSION "ESP ROOM Node V1.0"						// this value can be queried as device 3
+#include <DHT.h>
+#define VERSION "ESP Roomsensor V1.1"						// this value can be queried as device 3
 #define wifi_ssid "xxx"						// wifi station name
 #define wifi_password "xxxxxxxx"				// wifi password
 #define mqtt_server "192.168.xxx.xxx"			// mqtt server IP
-#define nodeId 3								// node ID
+#define nodeId 1								// node ID
+//#define DEBUG
+#define RANDOM //enable to make the chip to wait 0-30 sec before startup. useful if you have multiple sensors running on same powersupply.
 
 //Enable sensors
-#define LEDENABLE
-#define PIRENABLE
-//#define DHTENABLE
 #define REEDENABLE
-#define LIGHTENABLE
+#define WATERENABLE
 #define OWENABLE
 
 //	sensor setting
 
-#define LEDRPIN 4
-#define LEDGPIN 2
-#define LEDBPIN 15
-#define PIRPIN 12
-#define DHTPIN 16
-#define OWPIN 14
-#define LIGHTPIN A0
-//#define DHT44  //supports DHT11,DHT21,DHT22,DHT33,DHT44
+#define LEDRPIN 12
+#define LEDGPIN 13
+#define LEDBPIN 14
+#define PIRPIN 15
+#define DHTPIN 4
+#define DHTTYPE DHT22         // type of sensor
 #define DHTTEMPCORRECTION 0
-#define REEDPIN 5
+#define OWPIN 5
+#define LIGHTPIN A0
+#define REEDPIN 2
+#define WATERPIN 16
 #define SERIAL_BAUD 115200
 #define HOLDOFF 1000							// blocking period between triggered messages
 
@@ -81,34 +84,33 @@ long 	TXinterval = 60;						// periodic transmission interval in seconds
 
 int		DID;									// Device ID
 int		error;									// Syntax error code
-long	lastPeriod = -1;						// timestamp last transmission
-long 	lastBtnPress = -1;						// timestamp last buttonpress
-long	lastMinute = -1;						// timestamp last minute
+int LEDRState;
+int LEDGState;
+int LEDBState;
+int LightState;          // temperature
+int   signalStrength;             // radio signal strength
+long LEDState;
+long  lastPeriod = -1;            // timestamp last transmission
+long  lastMinute = -1;            // timestamp last minute
+long  lastPIRPress = -1;        // timestamp last PIRCHANGE
 long  upTime = 0;               // uptime in minutes
-int		signalStrength;							// radio signal strength
+float hum, temp;          // humidity, temperature
+bool  ackPIR = true;          // flag for message on PIR trigger
+bool  curPIR = true;        // current PIR state
+bool  lastPIR = true;       // last PIR state
+bool  mqttCon = false;            // MQTT broker connection flag
 bool  setAck = true;          // send ACK message on 'SET' request
 bool	wakeUp = true;							// wakeup indicator
 bool	msgBlock = false;						// flag to hold button message
 bool	readAction;								// indicates read / set a value
 bool	send0, send1, send2, send3, send5, send6, send7;
-bool	send10, send99;
+bool  send32, send33, send34, send40, send48, send49;
+bool	send10, send99, send64;
 String	IP;										// IPaddress of ESP
 char	buff_topic[30];							// mqtt topic
 char	buff_msg[32];							// mqtt message
-#ifdef LEDENABLE
-int LEDRState;
-int LEDGState;
-int LEDBState;
-long LEDState;
-bool  send32, send33, send34;
-#endif
-#ifdef PIRENABLE
-bool  ackPIR = true;          // flag for message on PIR trigger
-bool  send40;
-bool  curPIR = true;        // current PIR state
-bool  lastPIR = true;       // last PIR state
-long  lastPIRPress = -1;        // timestamp last PIRCHANGE
-#endif
+char  clientName[10];             // Mqtt client name
+
 #ifdef REEDENABLE
 bool  ackREED = true;          // flag for message on PIR trigger
 bool  send41;
@@ -116,17 +118,15 @@ bool  curREED = true;        // current PIR state
 bool  lastREED = true;       // last PIR state
 long  lastREEDPress = -1;        // timestamp last PIRCHANGE
 #endif
-#ifdef DHTENABLE
-#include <dht.h>
-float hum, temp;          // humidity, temperature
-bool  send48, send49;
-dht DHT;
-float dhttmpcor = DHTTEMPCORRECTION;
+
+#ifdef WATERENABLE
+bool  ackWATER = true;          // flag for message on PIR trigger
+bool  send42;
+bool  curWATER = true;        // current PIR state
+bool  lastWATER = true;       // last PIR state
+long  lastWATERPress = -1;        // timestamp last PIRCHANGE
 #endif
-#ifdef LIGHTENABLE
-int LightState;          // temperature
-bool  send64;
-#endif
+
 #ifdef OWENABLE
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -141,6 +141,7 @@ void mqttSubs(char* topic, byte* payload, unsigned int length);
 
 WiFiClient espClient;
 PubSubClient client(mqtt_server, 1883, mqttSubs, espClient); // instantiate MQTT client
+DHT dht(DHTPIN, DHTTYPE, 3);      // initialise temp/humidity sensor for 3.3 Volt arduino
 	
 //	FUNCTIONS
 
@@ -216,7 +217,6 @@ void mqttSubs(char* topic, byte* payload, unsigned int length) {	// receive and 
 				error = 0;
 			} else error = 3;						// invalid payload; do not process
 		}
-    #ifdef LEDENABLE
 		if (DID==32) {                // transmission interval
       if (readAction) {
         send32 = true;
@@ -281,15 +281,12 @@ void mqttSubs(char* topic, byte* payload, unsigned int length) {	// receive and 
         error = 0;
       }
     }
-    #endif
-    #ifdef PIRENABLE
     if (DID ==40) {                // IP address 
       if (readAction) {
         send40 = true;
         error = 0;
       } else error = 3;           // invalid payload; do not process
     }
-    #endif
     #ifdef REEDENABLE
     if (DID ==41) {                // IP address 
       if (readAction) {
@@ -298,7 +295,14 @@ void mqttSubs(char* topic, byte* payload, unsigned int length) {	// receive and 
       } else error = 3;           // invalid payload; do not process
     }
     #endif
-    #ifdef DHTENABLE
+    #ifdef WATERENABLE
+    if (DID ==42) {                // IP address 
+      if (readAction) {
+        send42 = true;
+        error = 0;
+      } else error = 3;           // invalid payload; do not process
+    }
+    #endif
     if (DID ==48) {                // IP address 
       if (readAction) {
         send48 = true;
@@ -311,7 +315,6 @@ void mqttSubs(char* topic, byte* payload, unsigned int length) {	// receive and 
         error = 0;
       } else error = 3;           // invalid payload; do not process
     }
-    #endif
     #ifdef OWENABLE
     if (DID ==51) {                // IP address 
       if (readAction) {
@@ -320,14 +323,12 @@ void mqttSubs(char* topic, byte* payload, unsigned int length) {	// receive and 
       } else error = 3;           // invalid payload; do not process
     }
     #endif
-    #ifdef LIGHTENABLE
     if (DID ==64) {                // IP address 
       if (readAction) {
         send64 = true;
         error = 0;
       } else error = 3;           // invalid payload; do not process
     }
-    #endif
 	}
 		} else error =1;
 		if (error !=0) {							// send error message
@@ -339,9 +340,12 @@ void mqttSubs(char* topic, byte* payload, unsigned int length) {	// receive and 
 
 	void reconnect() {								// reconnect to mqtt broker
 		sprintf(buff_topic, "home/esp_gw/sb/node%02d/#", nodeId);
+    sprintf(clientName, "ESP_%02d", nodeId);
+    mqttCon = true;
 		while (!client.connected()) {
 			Serial.print("Connect to MQTT broker...");
-			if (client.connect("ESP_GW")) { 
+			if (client.connect(clientName,"home/esp_gw/disconnected",0,true,clientName)) {
+        mqttCon = false;
 				client.subscribe(buff_topic);
 				Serial.println("connected");
 			} else {
@@ -356,7 +360,7 @@ void mqttSubs(char* topic, byte* payload, unsigned int length) {	// receive and 
 	if (wakeUp) {									// send wakeup message
 		wakeUp = false;
 		sprintf(buff_topic, "home/esp_gw/nb/node%02d/dev99", nodeId);
-		sprintf(buff_msg, "NODE %d WAKEUP", nodeId);
+		sprintf(buff_msg, "NODE %d WAKEUP: %s",  nodeId, clientName);
 		send99 = false;
 		pubMQTT(buff_topic, buff_msg);
 		}
@@ -406,7 +410,6 @@ void mqttSubs(char* topic, byte* payload, unsigned int length) {	// receive and 
 		pubMQTT(buff_topic, buff_msg);
 		send10 = false;
 	}
-  #ifdef LEDENABLE
   if (send32) {                  // send button pressed message
     sprintf(buff_topic, "home/esp_gw/nb/node%02d/dev32", nodeId);
     sprintf(buff_msg, "%d", LEDRState);
@@ -425,8 +428,6 @@ void mqttSubs(char* topic, byte* payload, unsigned int length) {	// receive and 
     pubMQTT(buff_topic, buff_msg);
     send34 = false;
   }
-  #endif
-  #ifdef PIRENABLE
 	if (send40) {									// send button pressed message
 		sprintf(buff_topic, "home/esp_gw/nb/node%02d/dev40", nodeId);
 		if (curPIR==HIGH) sprintf(buff_msg, "OFF");
@@ -434,7 +435,6 @@ void mqttSubs(char* topic, byte* payload, unsigned int length) {	// receive and 
 		pubMQTT(buff_topic, buff_msg);
 		send40 = false;
 	}
-  #endif
   #ifdef REEDENABLE
   if (send41) {                 // send button pressed message
     sprintf(buff_topic, "home/esp_gw/nb/node%02d/dev41", nodeId);
@@ -444,22 +444,29 @@ void mqttSubs(char* topic, byte* payload, unsigned int length) {	// receive and 
     send41 = false;
   }
 	#endif
-  #ifdef DHTENABLE
+  #ifdef WATERENABLE
+  if (send42) {                 // send button pressed message
+    sprintf(buff_topic, "home/esp_gw/nb/node%02d/dev42", nodeId);
+    if (curWATER==HIGH) sprintf(buff_msg, "OFF");
+    if (curWATER==LOW) sprintf(buff_msg, "ON");
+    pubMQTT(buff_topic, buff_msg);
+    send42 = false;
+  }
+  #endif
   if (send48) {                  // send uptime
     sprintf(buff_topic, "home/esp_gw/nb/node%02d/dev48", nodeId);
-    temp = (DHT.temperature, 1) + dhttmpcor;
+    temp = dht.readTemperature() + DHTTEMPCORRECTION;
     sprintf(buff_msg, "%d", temp);
     send48 = false;
     pubMQTT(buff_topic, buff_msg);
   }
   if (send49) {                  // send uptime
     sprintf(buff_topic, "home/esp_gw/nb/node%02d/dev49", nodeId);
-    temp = (DHT.humidity, 1);
-    sprintf(buff_msg, "%d", temp);
+    hum = dht.readHumidity();
+    sprintf(buff_msg, "%d", hum);
     send49 = false;
     pubMQTT(buff_topic, buff_msg);
   }
-  #endif
   #ifdef OWENABLE
   if (send51) {                  // send uptime
     sprintf(buff_topic, "home/esp_gw/nb/node%02d/dev51", nodeId);
@@ -469,7 +476,6 @@ void mqttSubs(char* topic, byte* payload, unsigned int length) {	// receive and 
     pubMQTT(buff_topic, buff_msg);
   }
   #endif
-  #ifdef LIGHTENABLE
   if (send64) {                  // send button pressed message
     sprintf(buff_topic, "home/esp_gw/nb/node%02d/dev64", nodeId);
     LightState = analogRead(LIGHTPIN);
@@ -477,14 +483,13 @@ void mqttSubs(char* topic, byte* payload, unsigned int length) {	// receive and 
     pubMQTT(buff_topic, buff_msg);
     send64 = false;
   }
-  #endif
 }
 
 	//	SETUP
 
 //===============================================================================================
 void setup() {									// set up serial, output and wifi connection
-  #ifdef LEDENABLE
+  dht.begin();            // initialise temp/hum sensor
   pinMode(LEDRPIN, OUTPUT);
   pinMode(LEDGPIN, OUTPUT);
   pinMode(LEDBPIN, OUTPUT);
@@ -495,13 +500,14 @@ void setup() {									// set up serial, output and wifi connection
   analogWrite(LEDGPIN, LEDGState);
   analogWrite(LEDBPIN, LEDBState);
   delay(100);
-  #endif
-  #ifdef PIRENABLE
   pinMode(PIRPIN, INPUT);
   delay(100);
-  #endif
   #ifdef REEDENABLE
   pinMode(REEDPIN, INPUT);
+  delay(100);
+  #endif
+  #ifdef WATERENABLE
+  pinMode(WATERPIN, INPUT);
   delay(100);
   #endif
   #ifdef OWENABLE
@@ -514,27 +520,22 @@ void setup() {									// set up serial, output and wifi connection
 	send3 = false;
 	send5 = false;
 	send10 = true;
-  #ifdef LEDENABLE
 	send32 = false;
   send33 = false;
   send34 = false;
-  #endif
-  #ifdef PIRENABLE
 	send40 = false;
-  #endif
   #ifdef REEDENABLE
   send41 = false;
   #endif
-  #ifdef DHTENABLE
+  #ifdef WATERENABLE
+  send42 = false;
+  #endif
   send48 = false;
   send49 = false;
-  #endif
   #ifdef OWENABLE
   send51 = false;
   #endif
-  #ifdef LIGHTENABLE
   send64 = false;
-  #endif
   Serial.begin(SERIAL_BAUD);
   Serial.println();							// connect to WIFI
   Serial.print("Connecting to ");
@@ -549,25 +550,12 @@ void setup() {									// set up serial, output and wifi connection
   Serial.println("IP address: ");
   IP = WiFi.localIP().toString();
   Serial.println(IP);
-  #ifdef DHT11
-  int chk = DHT.read11(DHTPIN);
-  #endif
-  #ifdef DHT21
-  int chk = DHT.read21(DHTPIN);
-  #endif
-  #ifdef DHT22
-  int chk = DHT.read22(DHTPIN);
-  #endif
-  #ifdef DHT33
-  int chk = DHT.read33(DHTPIN);
-  #endif
-  #ifdef DHT44
-  int chk = DHT.read44(DHTPIN);
-  #endif
-  #ifdef LEDENABLE
   LEDRState = 0;
   LEDGState = 0;
   LEDBState = 0;
+  #ifdef RANDOM
+  delay(random(30000));
+  #endif
   analogWrite(LEDRPIN, LEDRState);
   analogWrite(LEDGPIN, LEDGState);
   analogWrite(LEDBPIN, LEDBState);
@@ -583,7 +571,6 @@ void setup() {									// set up serial, output and wifi connection
   analogWrite(LEDRPIN, 255);
   delay(50);
   analogWrite(LEDRPIN, 0);
-  #endif
 }
 
 	//	LOOP
@@ -596,8 +583,6 @@ void setup() {									// set up serial, output and wifi connection
 	client.loop();
 
 		// DETECT INPUT CHANGE
-
-	#ifdef PIRENABLE
   curPIR = digitalRead(PIRPIN);
   msgBlock = ((millis() - lastPIRPress) < HOLDOFF);    // hold-off time for additional button messages
   if (!msgBlock &&  (curPIR != lastPIR)) {      // input changed ?
@@ -606,7 +591,6 @@ void setup() {									// set up serial, output and wifi connection
     send40 = true;                    // set button message flag
   lastPIR = curPIR;
   }
-  #endif
 
   #ifdef REEDENABLE
   curREED = digitalRead(REEDPIN);
@@ -616,6 +600,17 @@ void setup() {									// set up serial, output and wifi connection
     lastREEDPress = millis();              // take timestamp
     send41 = true;                    // set button message flag
   lastREED = curREED;
+  }
+  #endif
+
+  #ifdef WATERENABLE
+  curWATER = digitalRead(WATERPIN);
+  msgBlock = ((millis() - lastWATERPress) < HOLDOFF);    // hold-off time for additional button messages
+  if (!msgBlock &&  (curWATER != lastWATER)) {      // input changed ?
+    delay(5);
+    lastWATERPress = millis();              // take timestamp
+    send42 = true;                    // set button message flag
+  lastWATER = curWATER;
   }
   #endif
   
@@ -648,30 +643,22 @@ void setup() {									// set up serial, output and wifi connection
 			send3 = true;										// send version
       send5 = true;                   // send ack
       send10 = true;                   // send uptime
-      #ifdef LEDENABLE
-			send32 = true;										// output state
-      send33 = true;                    // output state
-      send34 = true;                    // output state
-      #endif
-      #ifdef PIRENABLE
-      send40 = true;                    // output state
-      #endif
+			send32 = true;										// red LED
+      send33 = true;                    // green LED
+      send34 = true;                    // blue LED
+      send40 = true;                    // Pir state
       #ifdef REEDENABLE
-      send41 = true;                    // output state
+      send41 = true;                    // REED state
       #endif
-      #ifdef DHTENABLE
-      send48 = true;                    // output state
-      send49 = true;                    // output state
+      #ifdef WATERENABLE
+      send42 = true;                    // WATER state
       #endif
+      send48 = true;                    // temperature
+      send49 = true;                    // humidity
       #ifdef OWENABLE
-      send51 = true;                    // output state
+      send51 = true;                    // onewire temperature
       #endif
-      #ifdef OWENABLE
-      send51 = true;                    // output state
-      #endif
-      #ifdef LIGHTENABLE
-      send64 = true;                    // output state
-      #endif
+      send64 = true;                    // light level
 			}
 		}
 
